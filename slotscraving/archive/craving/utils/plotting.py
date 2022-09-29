@@ -1,0 +1,556 @@
+from matplotlib import colors
+from matplotlib.pyplot import show
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import plotly.express as px
+
+import statsmodels.api as sm
+from scipy.stats import linregress
+
+
+COLORS = [
+    "rgb(4, 135, 137)",
+    "rgb(80, 61, 46)",
+    "rgb(212, 77, 39)",
+    "rgb(226, 167, 46)",
+    "rgb(102, 95, 30)",
+    "rgb(247, 96, 79)",
+    "rgb(111, 185, 191)",
+    "rgb(4, 135, 137)",
+    "rgb(80, 61, 46)",
+    "rgb(212, 77, 39)",
+    "rgb(226, 167, 46)",
+]
+
+STANDARD_COLORS = [
+    "cornflowerblue",
+    "lightcoral",
+    "indianred",
+    "lightseagreen",
+    "darkorchid",
+    "darkturquoise",
+    "darkseagreen",
+    "darkslateblue",
+    "darkmagenta",
+    "darkkhaki",
+    "darkcyan",
+]
+
+
+def _get_pid_params(batchfit, chosen_model, pid):
+    money_ws = {}
+    other_ws = {}
+    for var in ["w0", "w1", "w2"]:
+        money_ws[var] = []
+        other_ws[var] = []
+        for chain in (
+            batchfit.craving_models[chosen_model].traces[pid].posterior[f"{var}_mean"]
+        ):
+            money_ws[var].append(chain.values[:, 0])
+            other_ws[var].append(chain.values[:, 1])
+        money_ws[var] = np.hstack(money_ws[var])
+        other_ws[var] = np.hstack(other_ws[var])
+
+    pid_df = pd.concat(
+        [
+            pd.DataFrame.from_dict(
+                {
+                    "pid": [pid] * len(money_ws["w0"]),
+                    "w0": money_ws["w0"],
+                    "w1": money_ws["w1"],
+                    "w2": money_ws["w2"],
+                    "block": ["money"] * len(money_ws["w0"]),
+                }
+            ),
+            pd.DataFrame.from_dict(
+                {
+                    "pid": [pid] * len(other_ws["w0"]),
+                    "w0": other_ws["w0"],
+                    "w1": other_ws["w1"],
+                    "w2": other_ws["w2"],
+                    "block": ["other"] * len(other_ws["w0"]),
+                }
+            ),
+        ]
+    )
+    return pid_df
+
+
+def _get_corrs(batchfit, model_name):
+    corrs = []
+    for t in batchfit.pid_subset:
+        true = batchfit.craving_models[model_name].norm_craving_ratings[t][:, 1, :]
+        mean_pred = batchfit.craving_models[model_name].predictions[t].mean(axis=0)
+        corrs.append(
+            [
+                np.corrcoef(true[0, :], mean_pred[0, :])[0, 1],
+                np.corrcoef(true[1, :], mean_pred[1, :])[0, 1],
+            ]
+        )
+    return np.array(corrs)
+
+
+def _get_ics(batchfit, model_name, metric):
+    money_ics = (
+        batchfit.craving_models[model_name]
+        .ic[batchfit.craving_models[model_name].ic["PID"].isin(batchfit.pid_subset)][
+            f"Money {metric}"
+        ]
+        .values
+    )
+
+    other_ics = (
+        batchfit.craving_models[model_name]
+        .ic[batchfit.craving_models[model_name].ic["PID"].isin(batchfit.pid_subset)][
+            f"Other {metric}"
+        ]
+        .values
+    )
+    return money_ics, other_ics
+
+
+def plot_sample_predictions(batchfit, pid, width=800, height=500):
+
+    fig = make_subplots(rows=2, cols=1, subplot_titles=["Money", "Other"])
+
+    true_ratings = batchfit.craving_models[
+        batchfit.model_subset[0]
+    ].norm_craving_ratings[pid]
+    fig.add_trace(
+        go.Scatter(
+            x=np.arange(true_ratings.shape[2]),
+            y=true_ratings[0, 0, :],
+            name="True ratings",
+            showlegend=True,
+            line=dict(color='black', width=4, dash='dot')
+        ),
+        row=1,
+        col=1,
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=np.arange(true_ratings.shape[2]),
+            y=true_ratings[1, 0, :],
+            name="True ratings",
+            showlegend=True,
+            line=dict(color='black', width=4, dash='dot')
+        ),
+        row=2,
+        col=1,
+    )
+
+    for i, model_name in enumerate(batchfit.model_subset):
+        model = batchfit.craving_models[model_name]
+        money_model_prediction = model.predictions[pid][:, 0, :].mean(axis=0)
+        fig.add_trace(
+            go.Scatter(
+                x=np.arange(len(money_model_prediction)),
+                y=money_model_prediction,
+                line_color=STANDARD_COLORS[i],
+                name=model.craving_model_name,
+                showlegend=True,
+            ),
+            row=1,
+            col=1,
+        )
+        other_model_prediction = model.predictions[pid][:, 1, :].mean(axis=0)
+        fig.add_trace(
+            go.Scatter(
+                x=np.arange(len(other_model_prediction)),
+                y=other_model_prediction,
+                line_color=STANDARD_COLORS[i],
+                name=model.craving_model_name,
+                showlegend=False,
+            ),
+            row=2,
+            col=1,
+        )
+
+    fig.update_layout(height=height, width=width)
+    fig.show()
+
+
+def plot_model_comparison(
+    batchfit, metric="DIC", sum=False, width=800, height=500, x_range=None,
+):
+
+    model_dict = batchfit.craving_models
+    pid_subset = batchfit.pid_subset
+    model_subset = batchfit.model_subset
+
+    fig = go.Figure()
+
+    if sum:
+        x = ["Money", "Other"]
+        for i, (model_name, model) in enumerate(model_dict.items()):
+            if model_name not in model_subset:
+                continue
+            if pid_subset is not None:
+                filtered_df = model.ic.loc[model.ic["PID"].isin(pid_subset)]
+            else:
+                filtered_df = model.ic
+            ic = [
+                filtered_df[f"Money {metric}"].sum(),
+                filtered_df[f"Other {metric}"].sum(),
+            ]
+            fig.add_trace(
+                go.Bar(
+                    y=x,
+                    x=ic,
+                    name=f"{model.craving_model_name}",
+                    marker_color=STANDARD_COLORS[i],
+                    orientation="h",
+                )
+            )
+        fig.update_layout(barmode="group")
+
+    else:
+        for i, (model_name, model) in enumerate(model_dict.items()):
+            if model_name not in model_subset:
+                continue
+            if pid_subset is not None:
+                filtered_df = model.ic.loc[model.ic["PID"].isin(pid_subset)]
+            else:
+                filtered_df = model.ic
+
+            x = ["Money"] * filtered_df.shape[0] + ["Other"] * filtered_df.shape[0]
+            ic = np.hstack(
+                [
+                    filtered_df[f"Money {metric}"].values,
+                    filtered_df[f"Other {metric}"].values,
+                ]
+            )
+            fig.add_trace(
+                go.Box(
+                    x=ic,
+                    y=x,
+                    boxpoints="all",
+                    pointpos=0,
+                    marker_color=STANDARD_COLORS[i],
+                    name=model.craving_model_name,
+                    orientation="h",
+                )
+            )
+
+        fig.update_layout(boxmode="group")
+
+    fig.update_layout(
+        height=height, width=width,
+    )
+    fig.update_xaxes(title_text="IC")
+    fig.update_yaxes(title_text="Condition")
+    if x_range is not None:
+        fig.update_xaxes(range=x_range)
+
+    return fig
+
+
+def plot_corr_ic(batchfit, model_name, metric="DIC", width=1000, height=500):
+    x_names = [f"{elem} - {i}" for i, elem in enumerate(batchfit.pid_subset)]
+    corrs = _get_corrs(batchfit, model_name)
+    money_ics, other_ics = _get_ics(batchfit, model_name, metric)
+    annotations = []
+
+    fig = make_subplots(
+        rows=1,
+        cols=2,
+        specs=[[{"type": "scatter"}, {"type": "scatter"}]],
+        subplot_titles=["IC", "Correlations"],
+    )
+
+    ## IC plot
+    # Markers
+    fig.add_trace(
+        go.Scatter(
+            x=money_ics,
+            y=other_ics,
+            mode="markers",
+            name=model_name,
+            hovertemplate=x_names,
+            marker_color=STANDARD_COLORS[2],
+        ),
+        row=1,
+        col=1,
+    )
+    # Trendline
+    slope, intercept, r_value, p_value, std_err = linregress(money_ics, other_ics)
+    fig.add_trace(
+        go.Scatter(
+            x=money_ics,
+            y=slope * money_ics + intercept,
+            mode="lines",
+            marker_color=STANDARD_COLORS[2],
+            # name=f"{block} - Regression",
+            # marker=dict(color=COLORS[1]),
+        ),
+        row=1,
+        col=1,
+    )
+    # Annotation
+    fig.add_annotation(
+        xref="x domain",
+        yref="y domain",
+        xanchor="right",
+        yanchor="top",
+        x=0.98,
+        y=0.98,
+        text=f"r={np.round(r_value, 3)}, p={np.round(p_value, 3)}",
+        showarrow=False,
+        row=1,
+        col=1,
+        bgcolor="rgba(255, 255, 255, 0.9)",
+        bordercolor="black",
+        borderwidth=1,
+    )
+
+    ## Corr plot
+    # Markers
+    fig.add_trace(
+        go.Scatter(
+            x=corrs[:, 0],
+            y=corrs[:, 1],
+            mode="markers",
+            name=model_name,
+            hovertemplate=x_names,
+            marker_color=STANDARD_COLORS[3],
+        ),
+        row=1,
+        col=2,
+    )
+    # Trendline
+    slope, intercept, r_value, p_value, std_err = linregress(corrs[:, 0], corrs[:, 1])
+    fig.add_trace(
+        go.Scatter(
+            x=corrs[:, 0],
+            y=slope * corrs[:, 0] + intercept,
+            mode="lines",
+            marker_color=STANDARD_COLORS[3],
+            # name=f"{block} - Regression",
+            # marker=dict(color=COLORS[1]),
+        ),
+        row=1,
+        col=2,
+    )
+    # Annotation
+    fig.add_annotation(
+        xref="x domain",
+        yref="y domain",
+        xanchor="right",
+        yanchor="top",
+        x=0.98,
+        y=0.98,
+        text=f"r={np.round(r_value, 3)}, p={np.round(p_value, 3)}",
+        showarrow=False,
+        row=1,
+        col=2,
+        bgcolor="rgba(255, 255, 255, 0.9)",
+        bordercolor="black",
+        borderwidth=1,
+    )
+
+    fig.update_layout(
+        title=f"{batchfit.craving_models[model_name].craving_model_name} - Money vs Other condition",
+        width=width,
+        height=height,
+        showlegend=False,
+    )
+    fig.layout["xaxis"]["title"]["text"] = "Money IC"
+    fig.layout["yaxis"]["title"]["text"] = "Other IC"
+    fig.layout["xaxis2"]["title"]["text"] = "Money Correlation"
+    fig.layout["yaxis2"]["title"]["text"] = "Other Correlation"
+
+    return fig
+
+
+def corr_vs_ic(batchfit, model_name, metric="DIC", width=1000, height=500):
+    x_names = [f"{elem} - {i}" for i, elem in enumerate(batchfit.pid_subset)]
+    corrs = _get_corrs(batchfit, model_name)
+    money_ics, other_ics = _get_ics(batchfit, model_name, metric)
+    annotations = []
+
+    fig = make_subplots(
+        rows=1,
+        cols=2,
+        specs=[[{"type": "scatter"}, {"type": "scatter"}]],
+        subplot_titles=["Money", "Other"],
+    )
+
+    for i, (ics, block) in enumerate(zip([money_ics, other_ics], ["Money", "Other"])):
+        # PLOT POINTS
+        fig.add_trace(
+            go.Scatter(
+                x=corrs[:, i],
+                y=ics,
+                mode="markers",
+                name=block,
+                hovertemplate=x_names,
+                marker=dict(color=STANDARD_COLORS[i]),
+            ),
+            row=1,
+            col=i + 1,
+        )
+
+        # PLOT REGRESSION LINE
+        slope, intercept, r_value, p_value, std_err = linregress(corrs[:, i], ics)
+        fig.add_trace(
+            go.Scatter(
+                x=corrs[:, i],
+                y=slope * corrs[:, i] + intercept,
+                mode="lines",
+                name=f"{block} - Regression",
+                marker=dict(color=STANDARD_COLORS[i]),
+            ),
+            row=1,
+            col=i + 1,
+        )
+
+        # ANNOTATION OF R2
+        fig.add_annotation(
+            xref="x domain",
+            yref="y domain",
+            xanchor="right",
+            yanchor="top",
+            x=0.98,
+            y=0.98,
+            text=f"r={np.round(r_value, 3)}, p={np.round(p_value, 3)}",
+            showarrow=False,
+            row=1,
+            col=i + 1,
+            bgcolor="rgba(255, 255, 255, 0.9)",
+            bordercolor="black",
+            borderwidth=1,
+        )
+
+    fig.update_layout(
+        title=f"{batchfit.craving_models[model_name].craving_model_name} - Relationship between correlation and IC",
+        xaxis_title=f"Money Correlation",
+        yaxis_title=f"Other Correlation",
+        width=width,
+        height=height,
+        showlegend=False,
+    )
+    fig.layout["xaxis"]["title"]["text"] = "Correlation"
+    fig.layout["yaxis"]["title"]["text"] = "IC"
+    fig.layout["xaxis2"]["title"]["text"] = "Correlation"
+    fig.layout["yaxis2"]["title"]["text"] = "IC"
+
+    return fig
+
+
+def individual_parameter_estimation(
+    batchfit, model_name, pid=None, pid_num=None, width=1000, height=500
+):
+    if pid is not None and pid_num is not None:
+        raise ValueError("Only one of pid and pid_num can be specified")
+    if pid is None and pid_num is None:
+        raise ValueError("Either pid or pid_num must be specified")
+    if pid_num is not None:
+        pid = batchfit.pid_subset[pid_num]
+
+    pid_df = _get_pid_params(batchfit, model_name, pid)
+
+    return (
+        px.box(
+            pid_df,
+            y=["w0", "w1", "w2"],
+            color="block",
+            width=800,
+            height=500,
+            title=f"PID: {pid}",
+        ),
+        pid_df,
+    )
+
+
+def group_parameter_estimation(batchfit, model_name, width=1000, height=500):
+
+    group_estimates = pd.DataFrame(columns=["pid", "w0", "w1", "w2", "block"])
+    for pid in batchfit.pid_subset:
+        pid_df = _get_pid_params(batchfit, model_name, pid)
+        w0_money = pid_df[pid_df["block"] == "money"]["w0"].mean()
+        w1_money = pid_df[pid_df["block"] == "money"]["w1"].mean()
+        w2_money = pid_df[pid_df["block"] == "money"]["w2"].mean()
+        w0_other = pid_df[pid_df["block"] == "other"]["w0"].mean()
+        w1_other = pid_df[pid_df["block"] == "other"]["w1"].mean()
+        w2_other = pid_df[pid_df["block"] == "other"]["w2"].mean()
+
+        group_estimates = pd.concat(
+            [
+                group_estimates,
+                pd.DataFrame.from_dict(
+                    {
+                        "pid": [pid] * 2,
+                        "w0": [w0_money, w0_other],
+                        "w1": [w1_money, w1_other],
+                        "w2": [w2_money, w2_other],
+                        "block": ["money", "other"],
+                    }
+                ),
+            ]
+        )
+
+    fig = go.Figure()
+    money_w0 = group_estimates[group_estimates["block"] == "money"]["w0"]
+    money_w1 = group_estimates[group_estimates["block"] == "money"]["w1"]
+    money_w2 = group_estimates[group_estimates["block"] == "money"]["w2"]
+    other_w0 = group_estimates[group_estimates["block"] == "other"]["w0"]
+    other_w1 = group_estimates[group_estimates["block"] == "other"]["w1"]
+    other_w2 = group_estimates[group_estimates["block"] == "other"]["w2"]
+    fig.add_trace(
+        go.Box(
+            x=["w0"] * len(money_w0) + ["w1"] * len(money_w1) + ["w2"] * len(money_w2),
+            y=money_w0.values.tolist()
+            + money_w1.values.tolist()
+            + money_w2.values.tolist(),
+            name="money",
+            boxpoints="all",
+            pointpos=0,
+        )
+    )
+    fig.add_trace(
+        go.Box(
+            x=["w0"] * len(other_w0) + ["w1"] * len(other_w1) + ["w2"] * len(other_w2),
+            y=other_w0.values.tolist()
+            + other_w1.values.tolist()
+            + other_w2.values.tolist(),
+            name="other",
+            boxpoints="all",
+            pointpos=0,
+        )
+    )
+    fig.update_layout(
+        title="Parameter Estimates",
+        xaxis_title="Parameter",
+        yaxis_title="Estimate",
+        boxmode="group",
+        width=800,
+        height=500,
+    )
+    return fig, group_estimates
+
+
+def trendlines(data_frame, x, y, color):
+
+    figs = []
+    # rp_vals = []
+    for block in data_frame[color].unique():
+        block_df = data_frame[data_frame[color] == block]
+        slope, intercept, r_value, p_value, std_err = linregress(
+            block_df[x], block_df[y]
+        )
+        # rp_vals.append([r_value, p_value])
+
+        figs.append(
+            go.Scatter(
+                x=block_df[x],
+                y=slope * block_df[x] + intercept,
+                mode="lines",
+                name=f"{block} - r={r_value:.2f}, p={p_value:.2f}",
+            )
+        )
+
+    return figs  # , np.array(rp_vals)
+
