@@ -117,6 +117,32 @@ class MixedPrototype(ABC):
         # Return predicted cravings
         return at.exp(logp_actions[:, 1]),  t_pred_craving
     
+    def _just_Qs(self, actions, rewards, beta, cec_weight, *args):
+        # Note that the first parameter is always the sample_beta, it is a required argument
+        # Note that the second parameter is always the cec_weight, it is a required argument
+        t_rewards = at.as_tensor_variable(rewards, dtype='int32')
+        t_actions = at.as_tensor_variable(actions, dtype='int32')
+
+        # Compute all loop vals
+        # 0 - Q[left]
+        # 1 - Q[right]
+        # 2 - pred_craving
+        # 3 - Q[t-1]
+        # 4 - Q[t-2]
+        # 5 - PE[t-1]
+        # 6 - PE[t-2]
+        loopvals =  at.zeros((7,), dtype='float64')
+        loopvals, updates = aesara.scan(
+            fn=self.update_Q,
+            sequences=[t_actions, t_rewards],
+            outputs_info=[loopvals],
+            non_sequences=[*args])
+        t_Qs = loopvals[:, :2]
+        # t_pred_craving = pm.invlogit(loopvals[:, 2])
+        t_pred_craving = pm.invlogit(loopvals[:, 2] + cec_weight*t_rewards)
+
+        return loopvals, t_Qs, t_pred_craving
+    
     def _load_act_rew_craving_mood(self, pid_num, block, norm=True):
         pid = self.pid_list[pid_num]
         b = 0 if block=='money' else 1
@@ -186,6 +212,40 @@ class MixedPrototype(ABC):
             pm.sample_posterior_predictive(self.mood_traces[block][pid], extend_inferencedata=True)
             if self.save_mood_path is not None:
                 self.mood_traces[block][pid].to_netcdf(filestr)
+    
+    def get_Q_vals(self, pid_num, block, parameter_names):
+        pid = self.pid_list[pid_num]
+        pid_trace = self.traces[block][pid]
+        beta = float(pid_trace.posterior.beta.mean())
+        cec_weight = float(pid_trace.posterior.cec_weight.mean())
+        parameters = [float(pid_trace.posterior[p].mean()) for p in parameter_names]
+        
+        act, rew, cravings, moods = self._load_act_rew_craving_mood(pid_num, block, norm=False)
+        # with pm.Model() as model:
+        # Note that the first parameter is always the sample_beta, it is a required argument
+        # Note that the second parameter is always the cec_weight, it is a required argument
+        t_rewards = at.as_tensor_variable(rew, dtype='int32')
+        t_actions = at.as_tensor_variable(act, dtype='int32')
+
+        # Compute all loop vals
+        # 0 - Q[left]
+        # 1 - Q[right]
+        # 2 - pred_craving
+        # 3 - Q[t-1]
+        # 4 - Q[t-2]
+        # 5 - PE[t-1]
+        # 6 - PE[t-2]
+        loopvals =  at.zeros((7,), dtype='float64')
+        loopvals, updates = aesara.scan(
+            fn=self.update_Q,
+            sequences=[t_actions, t_rewards],
+            outputs_info=[loopvals],
+            non_sequences=[*parameters])
+        t_Qs = loopvals[:, :2]
+        # t_pred_craving = pm.invlogit(loopvals[:, 2])
+        t_pred_craving = pm.invlogit(loopvals[:, 2] + cec_weight*t_rewards)
+
+        return loopvals.eval(), t_Qs.eval(), t_pred_craving.eval()
 
 ## Inheritance models (EVRPE only)
 ### RW Models - Passive
@@ -1787,6 +1847,40 @@ class MixedPrototype_Beta(ABC):
             pm.sample_posterior_predictive(self.mood_traces[block][pid], extend_inferencedata=True)
             if self.save_mood_path is not None:
                 self.mood_traces[block][pid].to_netcdf(filestr)
+    
+    def get_Q_vals(self, pid_num, block, parameter_names):
+        pid = self.pid_list[pid_num]
+        pid_trace = self.traces[block][pid]
+        beta = float(pid_trace.posterior.beta.mean())
+        cec_weight = float(pid_trace.posterior.cec_weight.mean())
+        parameters = [float(pid_trace.posterior[p].mean()) for p in parameter_names]
+        
+        act, rew, cravings, moods = self._load_act_rew_craving_mood(pid_num, block, norm=False)
+        # with pm.Model() as model:
+        # Note that the first parameter is always the sample_beta, it is a required argument
+        # Note that the second parameter is always the cec_weight, it is a required argument
+        t_rewards = at.as_tensor_variable(rew, dtype='int32')
+        t_actions = at.as_tensor_variable(act, dtype='int32')
+
+        # Compute all loop vals
+        # 0 - Q[left]
+        # 1 - Q[right]
+        # 2 - pred_craving
+        # 3 - Q[t-1]
+        # 4 - Q[t-2]
+        # 5 - PE[t-1]
+        # 6 - PE[t-2]
+        loopvals =  at.zeros((7,), dtype='float64')
+        loopvals, updates = aesara.scan(
+            fn=self.update_Q,
+            sequences=[t_actions, t_rewards],
+            outputs_info=[loopvals],
+            non_sequences=[*parameters])
+        t_Qs = loopvals[:, :2]
+        # t_pred_craving = pm.invlogit(loopvals[:, 2])
+        t_pred_craving = pm.invlogit(loopvals[:, 2] + cec_weight*t_rewards)
+
+        return loopvals.eval(), t_Qs.eval(), t_pred_craving.eval()
 
 ### RW Models - Active Beta
 class A_Beta_RW_0step(MixedPrototype_Beta):
@@ -3014,6 +3108,39 @@ class RWCEC():
             pm.sample_posterior_predictive(self.mood_traces[block][pid], extend_inferencedata=True)
             if self.save_mood_path is not None:
                 self.mood_traces[block][pid].to_netcdf(filestr)
+
+    def get_Q_vals(self, pid_num, block, parameter_names):
+        pid = self.pid_list[pid_num]
+        pid_trace = self.traces[block][pid]
+        beta = float(pid_trace.posterior.beta.mean())
+        parameters = [float(pid_trace.posterior[p].mean()) for p in parameter_names]
+        
+        act, rew, cravings, moods = self._load_act_rew_craving_mood(pid_num, block, norm=False)
+        # with pm.Model() as model:
+        # Note that the first parameter is always the sample_beta, it is a required argument
+        # Note that the second parameter is always the cec_weight, it is a required argument
+        t_rewards = at.as_tensor_variable(rew, dtype='int32')
+        t_actions = at.as_tensor_variable(act, dtype='int32')
+
+        # Compute all loop vals
+        # 0 - Q[left]
+        # 1 - Q[right]
+        # 2 - pred_craving
+        # 3 - Q[t-1]
+        # 4 - Q[t-2]
+        # 5 - PE[t-1]
+        # 6 - PE[t-2]
+        loopvals =  at.zeros((7,), dtype='float64')
+        loopvals, updates = aesara.scan(
+            fn=self.update_Q,
+            sequences=[t_actions, t_rewards],
+            outputs_info=[loopvals],
+            non_sequences=[*parameters])
+        t_Qs = loopvals[:, :2]
+        # t_pred_craving = pm.invlogit(loopvals[:, 2])
+        t_pred_craving = parameters[1] + parameters[2]*t_rewards
+
+        return loopvals.eval(), t_Qs.eval(), t_pred_craving.eval()
 
 ## Batchfit class
 class BatchFit(object):

@@ -18,7 +18,7 @@ class Random(Prototypes.DecisionModelPrototype):
     
     # DETERMINE LIKELIHOOD OF PARAMETER
     def _llik(self, x, *args):
-        """Likelihood functions for RW model
+        """Likelihood functions for biased model
 
         Args:
             x (tuple): Contains the parameters to be optimized
